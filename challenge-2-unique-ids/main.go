@@ -13,7 +13,7 @@ import (
 func main() {
 	n := maelstrom.NewNode()
 
-	// snowflakeNode, err := snowflake.NewNode(1)
+	// snowflakeNode, err := snowflake.NewNode(n.ID())
 	// if err != nil {
 	// 	log.Fatal(err)
 	// }
@@ -26,6 +26,10 @@ func main() {
 		body["id"] = generateObjectIdStr() // mongo objectId. PASS
 		// body["id"] = generateSnowflakeId(snowflakeNode) // Twitter's snowflake. Didn't work, we need to pass the Node ID dynamically
 		// body["id"] = generateIdByTimestamp() // timestamp unix-microseconds. Didn't work
+		// {
+		// "type": "generate_ok",
+		// "id": 1234124
+		// }
 
 		return n.Reply(msg, body)
 	})
