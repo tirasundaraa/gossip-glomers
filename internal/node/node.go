@@ -1,9 +1,14 @@
 package node
 
-import maelstrom "github.com/jepsen-io/maelstrom/demo/go"
+import (
+	"sync/atomic"
+
+	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
+)
 
 type Server struct {
-	Node *maelstrom.Node
+	Node    *maelstrom.Node
+	counter atomic.Int64
 }
 
 func NewServer() *Server {

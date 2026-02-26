@@ -16,6 +16,17 @@ build:
 challenge-1: build
 	$(MAELSTROM_BINARY) test -w echo --bin $(BUILD_DIR)/$(BINARY_NAME) --node-count 1 --time-limit 10
 
+# Challenge 2: Unique IDs
+# -w unique-ids: The workload to run
+# --bin: Path to your binary
+# --node-count 3: 3 nodes needed for Unique IDs
+# --time-limit 30: Run for 30 seconds
+# --rate 1000: 1000 messages per second
+# --availability total: All nodes are available
+# --nemesis partition: Partition the network
+challenge-2: build
+	$(MAELSTROM_BINARY) test -w unique-ids --bin $(BUILD_DIR)/$(BINARY_NAME) --node-count 3 --time-limit 30 --rate 1000 --availability total --nemesis partition
+
 # Helper to view the logs if something crashes
 # Maelstrom logs are in store/<test-name>/node-logs/
 clean:
