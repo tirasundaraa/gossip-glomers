@@ -36,6 +36,10 @@ challenge-3a: build
 challenge-3b: build
 	./maelstrom/maelstrom test -w broadcast --bin ./bin/node --node-count 5 --time-limit 20 --rate 10
 
+# Makefile for 3c (Notice the partition nemesis!)
+challenge-3c: build
+	./maelstrom/maelstrom test -w broadcast --bin ./bin/node --node-count 5 --time-limit 20 --rate 10 --nemesis partition
+
 # Helper to view the logs if something crashes
 # Maelstrom logs are in store/<test-name>/node-logs/
 clean:

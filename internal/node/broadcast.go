@@ -74,3 +74,26 @@ func (s *Server) TopologyHandler(m maelstrom.Message) error {
 		"type": "topology_ok",
 	})
 }
+
+func (s *Server) SyncStateHandler(m maelstrom.Message) error {
+
+	var body struct {
+		Type     string        `json:"type"`
+		Messages []json.Number `json:"messages"`
+	}
+
+	if err := json.Unmarshal(m.Body, &body); err != nil {
+		return err
+	}
+
+	for _, msg := range body.Messages {
+		id, err := msg.Int64()
+		if err != nil {
+			return err
+		}
+
+		s.addMessage(id)
+	}
+
+	return nil
+}
