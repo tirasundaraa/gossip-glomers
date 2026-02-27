@@ -27,6 +27,15 @@ challenge-1: build
 challenge-2: build
 	$(MAELSTROM_BINARY) test -w unique-ids --bin $(BUILD_DIR)/$(BINARY_NAME) --node-count 3 --time-limit 30 --rate 1000 --availability total --nemesis partition
 
+# Challenge 3a: Broadcast
+# Makefile
+challenge-3a: build
+	./maelstrom/maelstrom test -w broadcast --bin ./bin/node --node-count 1 --time-limit 20 --rate 10
+
+# Challenge 3b
+challenge-3b: build
+	./maelstrom/maelstrom test -w broadcast --bin ./bin/node --node-count 5 --time-limit 20 --rate 10
+
 # Helper to view the logs if something crashes
 # Maelstrom logs are in store/<test-name>/node-logs/
 clean:

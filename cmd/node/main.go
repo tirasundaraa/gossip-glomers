@@ -11,6 +11,9 @@ func main() {
 
 	s.Node.Handle("echo", s.EchoHandler)
 	s.Node.Handle("generate", s.UniqueIdHandler)
+	s.Node.Handle("broadcast", s.BroadcastHandler)
+	s.Node.Handle("read", s.ReadHandler)
+	s.Node.Handle("topology", s.TopologyHandler)
 
 	if err := s.Node.Run(); err != nil {
 		log.Fatal(err)
