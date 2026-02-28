@@ -14,7 +14,7 @@ func main() {
 	s.Node.Handle("broadcast", s.BroadcastHandler)
 	s.Node.Handle("read", s.ReadHandler)
 	s.Node.Handle("topology", s.TopologyHandler)
-	s.Node.Handle("sync_state", s.SyncStateHandler)
+	s.Node.Handle("gossip", s.GossipHandler)
 
 	// Start the background worker for the anti-entropy synchronization
 	go s.StartGossipWorker()

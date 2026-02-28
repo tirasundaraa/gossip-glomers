@@ -22,20 +22,7 @@ func (s *Server) BroadcastHandler(m maelstrom.Message) error {
 	}
 
 	if s.addMessage(id) {
-		// Broadcast to the neighbors
-		for _, nodeID := range s.neighbors {
-			if nodeID != m.Src {
-				s.Node.Send(nodeID, map[string]any{
-					"type":    "broadcast",
-					"message": id,
-				})
-			}
-		}
-	}
-
-	// no need to reply to broadcast from other Nodes
-	if m.Src[0] == 'n' {
-		return nil
+		s.propagate(id, m.Src)
 	}
 
 	return s.Node.Reply(m, map[string]any{
@@ -57,26 +44,35 @@ func (s *Server) ReadHandler(m maelstrom.Message) error {
 
 // TopologyHandler handles the topology message and updates the neighbors
 func (s *Server) TopologyHandler(m maelstrom.Message) error {
-	var body struct {
-		Type     string              `json:"type"`
-		Topology map[string][]string `json:"topology"`
+	allNodes := s.Node.NodeIDs()
+	myID := s.Node.ID()
+	var myIndex int
+	for i, id := range allNodes {
+		if id == myID {
+			myIndex = i
+			break
+		}
 	}
 
-	if err := json.Unmarshal(m.Body, &body); err != nil {
-		return err
+	s.neighbors = []string{}
+	fanOut := 10 // <--- The magic number
+
+	if myIndex > 0 {
+		parentIndex := (myIndex - 1) / fanOut
+		s.neighbors = append(s.neighbors, allNodes[parentIndex])
 	}
 
-	if neighbors, ok := body.Topology[s.Node.ID()]; ok {
-		s.neighbors = neighbors
+	for j := 1; j <= fanOut; j++ {
+		childIndex := (myIndex * fanOut) + j
+		if childIndex < len(allNodes) {
+			s.neighbors = append(s.neighbors, allNodes[childIndex])
+		}
 	}
 
-	return s.Node.Reply(m, map[string]any{
-		"type": "topology_ok",
-	})
+	return s.Node.Reply(m, map[string]any{"type": "topology_ok"})
 }
 
-func (s *Server) SyncStateHandler(m maelstrom.Message) error {
-
+func (s *Server) GossipHandler(m maelstrom.Message) error {
 	var body struct {
 		Type     string        `json:"type"`
 		Messages []json.Number `json:"messages"`
@@ -92,8 +88,12 @@ func (s *Server) SyncStateHandler(m maelstrom.Message) error {
 			return err
 		}
 
-		s.addMessage(id)
+		if s.addMessage(id) {
+			s.propagate(id, m.Src)
+		}
 	}
 
-	return nil
+	return s.Node.Reply(m, map[string]any{
+		"type": "gossip_ok",
+	})
 }

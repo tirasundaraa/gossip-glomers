@@ -40,6 +40,10 @@ challenge-3b: build
 challenge-3c: build
 	./maelstrom/maelstrom test -w broadcast --bin ./bin/node --node-count 5 --time-limit 20 --rate 10 --nemesis partition
 
+# Challenge 3d (efficiency)
+challenge-3d: build
+	./maelstrom/maelstrom test -w broadcast --bin ./bin/node --node-count 25 --time-limit 20 --rate 100 --latency 100
+
 # Helper to view the logs if something crashes
 # Maelstrom logs are in store/<test-name>/node-logs/
 clean:

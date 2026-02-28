@@ -1,24 +1,36 @@
 package node
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 func (s *Server) StartGossipWorker() {
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(50 * time.Millisecond)
 	for range ticker.C {
-		// 1. Get ALL messages I currently know about
-		knownMessages := s.getBroadcastMessages()
+		for _, neighborID := range s.Node.NodeIDs() {
+			if s.Node.ID() == neighborID {
+				continue // skip self
+			}
 
-		// 2. Skip if there is no message or no neighbors
-		if len(knownMessages) == 0 || len(s.neighbors) == 0 {
-			continue
-		}
+			batch := s.extractPending(neighborID)
+			if len(batch) == 0 {
+				continue
+			}
 
-		// 3. Send my entire state to my neighbors
-		for _, neighbor := range s.neighbors {
-			s.Node.Send(neighbor, map[string]any{
-				"type":     "sync_state", // a custom message type we invent
-				"messages": knownMessages,
-			})
+			gossipFn := func(neighborId string, messages []int64) {
+				ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+				defer cancel()
+				_, err := s.Node.SyncRPC(ctx, neighborId, map[string]any{
+					"type":     "gossip",
+					"messages": messages,
+				})
+				if err != nil {
+					s.requeueMessages(neighborId, messages)
+				}
+			}
+
+			go gossipFn(neighborID, batch)
 		}
 	}
 }
