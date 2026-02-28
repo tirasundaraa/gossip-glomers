@@ -44,6 +44,10 @@ challenge-3c: build
 challenge-3d: build
 	./maelstrom/maelstrom test -w broadcast --bin ./bin/node --node-count 25 --time-limit 20 --rate 100 --latency 100
 
+# Challenge 3e (efficiency part-2)
+challenge-3e: build
+	./maelstrom/maelstrom test -w broadcast --bin ./bin/node --node-count 25 --time-limit 20 --rate 100 --latency 100
+
 # Helper to view the logs if something crashes
 # Maelstrom logs are in store/<test-name>/node-logs/
 clean:
