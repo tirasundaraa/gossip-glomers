@@ -8,7 +8,7 @@ import (
 func (s *Server) StartGossipWorker() {
 	ticker := time.NewTicker(50 * time.Millisecond)
 	for range ticker.C {
-		for _, neighborID := range s.Node.NodeIDs() {
+		for _, neighborID := range s.neighbors {
 			if s.Node.ID() == neighborID {
 				continue // skip self
 			}
