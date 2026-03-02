@@ -31,15 +31,10 @@ func (s *Server) BroadcastHandler(m maelstrom.Message) error {
 }
 
 func (s *Server) ReadHandler(m maelstrom.Message) error {
-	var body map[string]any
-
-	if err := json.Unmarshal(m.Body, &body); err != nil {
-		return err
-	}
-
-	body["type"] = "read_ok"
-	body["messages"] = s.getBroadcastMessages()
-	return s.Node.Reply(m, body)
+	return s.Node.Reply(m, map[string]any{
+		"type":     "read_ok",
+		"messages": s.getBroadcastMessages(),
+	})
 }
 
 // TopologyHandler handles the topology message and updates the neighbors

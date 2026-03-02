@@ -95,18 +95,18 @@ func (s *Server) extractPending(neighborID string) []int64 {
 	return pendingMessages
 }
 
-func (s *Server) requeueMessages(neighbordID string, failedBatch []int64) {
+func (s *Server) requeueMessages(neighborID string, failedBatch []int64) {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
 
 	// Just add them back! If 44 arrived while we were gone,
 	// it stays perfectly safe. The queue becomes [42, 43, 44].
 	for _, id := range failedBatch {
-		if s.pendingMessages[neighbordID] == nil {
-			continue
+		if s.pendingMessages[neighborID] == nil {
+			s.pendingMessages[neighborID] = make(map[int64]struct{})
 		}
 
-		s.pendingMessages[neighbordID][id] = struct{}{}
+		s.pendingMessages[neighborID][id] = struct{}{}
 	}
 }
 

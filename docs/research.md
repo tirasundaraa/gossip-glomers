@@ -12,23 +12,36 @@ The repository has two distinct layers of history: an older set of standalone ch
 
 ```
 gossip-glomers/
-├── cmd/node/main.go            # Single entry point - registers all handlers, runs event loop
+├── cmd/node/main.go                    # Single entry point - registers all handlers, runs event loop
 ├── internal/node/
-│   ├── node.go                 # Server struct + NewServer constructor
-│   ├── echo.go                 # Challenge 1: Echo handler
-│   └── unique_id.go            # Challenge 2: Unique ID handler
-├── archived/                   # Previous standalone implementations (historical)
+│   ├── node.go                         # Server struct, shared state, pending-message machinery
+│   ├── echo.go                         # Challenge 1: Echo handler
+│   ├── unique_id.go                    # Challenge 2: Unique ID handler
+│   ├── broadcast.go                    # Challenge 3: Broadcast, Read, Topology, Gossip handlers
+│   └── anti_entropy_worker.go          # Challenge 3: Background gossip worker (anti-entropy)
+├── archived/                           # Previous standalone implementations (historical)
 │   ├── challenge-1-echo/
 │   ├── challenge-2-unique-ids/
 │   ├── challenge-3a-broadcast/
 │   ├── challenge-3b-broadcast/
 │   └── challenge-3c-broadcast/
-├── maelstrom/                  # Vendored Maelstrom binary + Go library + docs
-├── store/                      # Test result artifacts (gitignored)
-├── docs/                       # Challenge write-ups
-├── Makefile                    # Build + test automation
-├── go.mod / go.sum             # Go module (single dependency: jepsen-io/maelstrom)
-└── .gitignore                  # Ignores maelstrom/, bin/, store/
+├── docs/                               # Challenge write-ups and research
+│   ├── 02-unique-ids.md
+│   ├── 03a-3b-broadcast.md
+│   ├── 03c-broadcast-fault-tolerant.md
+│   ├── 03d-03e-broadcast-spanning-tree.md
+│   ├── 03d-broadcast-efficiency.md
+│   └── research.md                     # This file
+├── maelstrom/                          # Vendored Maelstrom binary + Go library + docs (gitignored)
+├── store/                              # Test result artifacts (gitignored)
+│   ├── echo/
+│   ├── unique-ids/
+│   └── broadcast/
+│       ├── <30+ timestamped test runs>/
+│       └── latest -> <most recent run>
+├── Makefile                            # Build + test automation
+├── go.mod / go.sum                     # Go module (single dependency: jepsen-io/maelstrom)
+└── .gitignore                          # Ignores maelstrom/, bin/, store/
 ```
 
 ---
@@ -68,23 +81,75 @@ Key concurrency detail: the `Run()` loop reads messages sequentially from STDIN 
 
 ### Architecture
 
-The current code follows a clean separation:
+The current code is a single binary that handles all challenges (1, 2, 3a-3e). Maelstrom only sends message types relevant to the workload being tested, so unused handlers are inert.
 
-- **`cmd/node/main.go`** - Entry point. Creates a `Server`, registers handlers for `"echo"` and `"generate"` message types, then calls `Node.Run()` which blocks on the STDIN event loop.
-- **`internal/node/node.go`** - Defines `Server` struct wrapping a `*maelstrom.Node` and an `atomic.Int64` counter. The counter is used for unique ID generation.
-- **`internal/node/echo.go`** - Echo handler.
-- **`internal/node/unique_id.go`** - Unique ID generation handler.
+- **`cmd/node/main.go`** - Entry point. Creates a `Server`, registers six handlers (`echo`, `generate`, `broadcast`, `read`, `topology`, `gossip`), starts the background gossip worker in a goroutine, then calls `Node.Run()` which blocks on the STDIN event loop.
+- **`internal/node/node.go`** - Defines the `Server` struct with all shared state and the pending-message machinery (add, extract, requeue, propagate).
+- **`internal/node/echo.go`** - Challenge 1: Echo handler.
+- **`internal/node/unique_id.go`** - Challenge 2: Unique ID generation handler.
+- **`internal/node/broadcast.go`** - Challenge 3: Broadcast, Read, Topology, and Gossip handlers.
+- **`internal/node/anti_entropy_worker.go`** - Challenge 3: Background anti-entropy worker that periodically flushes batched messages to neighbors.
 
-All handlers are methods on `*Server`, giving them shared access to the node and counter state.
+All handlers are methods on `*Server`, giving them shared access to the node, counter, messages, topology, and pending-message state.
 
-### Challenge 1: Echo
+### The `Server` Struct
+
+```go
+type Server struct {
+    Node *maelstrom.Node
+
+    // Challenge 2: unique id generation
+    counter atomic.Int64
+
+    // Challenge 3: broadcast
+    broadcastMu sync.RWMutex
+    messages    map[int64]struct{}
+
+    // Topology (set once at startup, no mutex needed)
+    neighbors []string
+
+    // Challenge 3d: broadcast efficiency
+    pendingMu       sync.RWMutex
+    pendingMessages map[string]map[int64]struct{}
+}
+```
+
+| Field | Type | Purpose | Synchronization |
+|---|---|---|---|
+| `Node` | `*maelstrom.Node` | Maelstrom protocol interface | Internally thread-safe |
+| `counter` | `atomic.Int64` | Unique ID sequence number | Lock-free atomic ops |
+| `messages` | `map[int64]struct{}` | Set of all seen broadcast values | `broadcastMu` (RWMutex) |
+| `neighbors` | `[]string` | Tree topology neighbor list | Written once, read many (no mutex) |
+| `pendingMessages` | `map[string]map[int64]struct{}` | Per-neighbor outbound message buffer | `pendingMu` (RWMutex) |
+
+### Shared State Methods
+
+Five helper methods on `*Server` manage the shared state:
+
+1. **`addMessage(id) bool`** - Atomically checks-and-inserts a message into `messages`. Returns `true` if the message was genuinely new, `false` if already seen. This combined check-and-write under a single write lock eliminates the TOCTOU race condition that plagued the earlier 3b implementation.
+
+2. **`getBroadcastMessages() []int64`** - Returns a snapshot copy of all seen messages under a read lock.
+
+3. **`addPendingMessage(neighborID, msg)`** - Adds a message to the per-neighbor outbound buffer. Lazily initializes the inner map.
+
+4. **`extractPending(neighborID) []int64`** - Atomically extracts all pending messages for a neighbor and replaces the bucket with a fresh empty map. This "nuke and replace" pattern is O(1) for the clear and avoids races between the worker extracting and handlers inserting new messages concurrently.
+
+5. **`requeueMessages(neighborID, failedBatch)`** - Merges a failed batch back into the pending buffer. Safe even if new messages arrived in the interim.
+
+6. **`propagate(id, excludeNode)`** - Queues a message for delivery to all neighbors except the sender, preventing infinite loops.
+
+---
+
+## Challenge 1: Echo
 
 The simplest challenge. Receives a message, sets `type` to `"echo_ok"`, and replies. The entire original body (including the `echo` field) is preserved and sent back. This validates that the node can correctly participate in the Maelstrom protocol.
 
 **Test parameters**: 1 node, 10 seconds.
 **Results**: 47 operations, 100% success, 2.04 messages per operation (one request + one response).
 
-### Challenge 2: Unique ID Generation
+---
+
+## Challenge 2: Unique ID Generation
 
 The core challenge here is generating **globally unique IDs** across multiple nodes, under network partitions, at high throughput, with no central coordinator.
 
@@ -104,82 +169,387 @@ Three sources of entropy combine to guarantee uniqueness:
 
 **Why not just `NodeID + counter`?** Would work for single-run uniqueness, but crashes would reset the counter.
 
-**Trade-offs documented by the author**:
+**Trade-offs**:
 - String IDs are longer than 64-bit Snowflake IDs (less efficient to index in a DB).
 - Clock dependency means IDs aren't strictly time-ordered across nodes (clock skew), though uniqueness is unaffected thanks to the NodeID prefix.
 
 **Test parameters**: 3 nodes, 30 seconds, 1000 requests/second, total availability required, network partitions injected.
-**Results**: 24,713 operations, 0 failures, 0 duplicates, 2.00 messages per operation. ID range from `"n0-1772102102555726000-1"` to `"n2-1772102132547693000-6227"`.
+**Results**: 24,650 operations, 0 failures, 0 duplicates, 2.00 messages per operation. ID range from `"n0-..."` to `"n2-..."`.
 
 ---
 
-## Archived Implementations (Historical Evolution)
+## Challenge 3a: Single-Node Broadcast
 
-The `archived/` directory preserves earlier standalone implementations. Each was its own Go module. Studying them reveals the learning progression:
+Before building the network protocol, a thread-safe way to store broadcasted messages on a single node was needed.
 
-### Challenge 1 (archived): Echo
+**State structure**: A `map[int64]struct{}` (mathematical set) protected by `sync.RWMutex`. The empty struct consumes zero bytes; only the keys (message IDs) matter.
 
-Identical logic to the current version, but as a flat `main.go` with an inline closure handler instead of a method on a struct.
+**Handlers**:
+- `BroadcastHandler`: Stores the message value, replies `broadcast_ok`.
+- `ReadHandler`: Returns all stored messages as `read_ok`.
+- `TopologyHandler`: Acknowledges but topology is irrelevant for single-node.
 
-### Challenge 2 (archived): Unique IDs - Experimentation
+**Test parameters**: 1 node, 20 seconds, 10 req/s.
 
-The archived version reveals the author's experimentation with multiple ID generation strategies:
+---
 
-1. **Google UUID (`uuid.New().String()`)** - Passed. Relies on cryptographic randomness. Works but is heavier than needed.
-2. **MongoDB ObjectID (`primitive.NewObjectID().Hex()`)** - Passed. 12-byte IDs combining timestamp + machine ID + process ID + counter. The final chosen approach in the archive.
-3. **Twitter Snowflake (`snowflake.Node.Generate()`)** - **Did not work**. Required passing the Node ID as an integer, but Maelstrom assigns string IDs like `"n0"`. The library expected a numeric node identifier.
-4. **Timestamp only (`time.Now().UnixMicro()`)** - **Did not work**. Collisions between nodes generating the same microsecond timestamp. No spatial uniqueness.
+## Challenge 3b: Multi-Node Broadcast (Gossip Protocol)
 
-The current implementation supersedes all of these with the simpler composite key approach that has zero external dependencies.
+Expanded to 5 nodes. When a node receives a new message, it must relay it to its neighbors.
 
-### Challenge 3a (archived): Single-Node Broadcast
+### Deduplication and the TOCTOU Fix
 
-A naive single-node implementation:
-- Stores broadcast messages in a plain `[]float64` slice (not thread-safe).
-- `broadcast`: appends the message value to the slice, replies `broadcast_ok`.
-- `read`: returns the entire slice.
-- `topology`: acknowledges but ignores the topology.
+The biggest danger in a gossip protocol is infinite loops (A tells B, B tells A, forever). The `addMessage()` method combines check-and-write into a single atomic operation under an exclusive write lock:
 
-This only works for single-node tests because there's no inter-node communication, and the slice isn't protected by a mutex (a data race with Maelstrom's concurrent handler dispatch).
+```go
+func (s *Server) addMessage(id int64) bool {
+    s.broadcastMu.Lock()
+    defer s.broadcastMu.Unlock()
+    if _, seen := s.messages[id]; seen {
+        return false
+    }
+    s.messages[id] = struct{}{}
+    return true
+}
+```
 
-### Challenge 3b (archived): Multi-Node Broadcast
+Without this, a race condition exists: multiple goroutines could see the message as "unseen" simultaneously and broadcast it multiple times.
 
-Adds multi-node support with several key improvements:
+### Sender Exclusion
 
-1. **Thread-safe storage**: switched from `[]float64` to `map[int]struct{}` protected by `sync.RWMutex`.
-2. **Deduplication**: checks if a message was already seen before processing. This prevents infinite broadcast loops.
-3. **Flooding protocol**: on receiving a new broadcast, forwards it to every other node in the cluster (excluding self and the sender) using `Node.Send()` (fire-and-forget).
+When propagating, the node skips the sender to reduce redundant messages:
 
-The deduplication-before-forward pattern is critical: without it, A sends to B, B sends back to A, A sends to B... forever.
+```go
+func (s *Server) propagate(id int64, excludeNode string) {
+    for _, neighborID := range s.neighbors {
+        if neighborID == excludeNode {
+            continue
+        }
+        s.addPendingMessage(neighborID, id)
+    }
+}
+```
 
-Weakness: `Node.Send()` is fire-and-forget. If a message is dropped (network partition), it's lost permanently. This passes the basic multi-node test but fails under partitions.
+**Test parameters**: 5 nodes, 20 seconds, 10 req/s.
 
-### Challenge 3c (archived): Fault-Tolerant Broadcast
+---
 
-The most sophisticated archived implementation. Addresses message loss with:
+## Challenge 3c: Fault-Tolerant Broadcast (Network Partitions)
 
-1. **`MemStore`**: A dedicated thread-safe key-value store (`sync.RWMutex` + `map[int]struct{}`), cleanly separated into its own file. Provides `Put`, `IsExist`, and `Keys` operations.
-2. **RPC with retries**: Instead of `Send()`, uses `Node.RPC()` which registers a callback. The callback sets an `ack` flag (protected by its own mutex) when a response arrives.
-3. **Goroutine-per-peer**: Each broadcast spawns a goroutine per target peer that retries up to 100 times.
-4. **Linear backoff**: Wait time increases linearly: `i * 100ms` on the i-th retry (100ms, 200ms, 300ms...). Max wait would be 10 seconds on the 100th retry.
-5. **Non-blocking**: The reply to the client is sent immediately after storing locally; retries happen asynchronously in background goroutines.
+The test harness introduces `--nemesis partition`, virtually cutting network cables. Fire-and-forget `Send()` messages get silently dropped, so isolated nodes miss broadcasts and fail `read` checks.
 
-The retry logic has a subtle detail: `Node.RPC()` is asynchronous - it sends the message and registers a callback for later. The loop checks `!ack` before each retry, so once the callback fires and sets `ack = true`, the loop exits. The `ackMu` mutex prevents a race between the callback goroutine and the retry loop reading `ack`.
+### The Architecture Decision: Anti-Entropy vs. RPC Retries
+
+Two approaches to guarantee delivery under partitions:
+
+1. **Message-centric (RPC retries)**: For every broadcast, send an RPC and wait for acknowledgment. Retry on timeout.
+   - *Drawback*: During prolonged partitions, spawns thousands of sleeping/retrying goroutines; potential memory leaks.
+
+2. **State-centric (anti-entropy)**: A single background worker periodically synchronizes state with neighbors.
+   - *Advantage*: Predictable resource usage, conceptually simpler, used by DynamoDB and Cassandra.
+
+The project chose **anti-entropy**. A background worker ticks periodically and synchronizes pending messages with neighbors. When messages fail to deliver, they are requeued for the next tick.
+
+### How It Works
+
+The `BroadcastHandler` and `GossipHandler` both follow the same pattern:
+1. Parse the incoming message(s).
+2. For each message, call `addMessage()`. If new, call `propagate()` to queue it for all neighbors (except the sender).
+3. Reply immediately to the caller.
+
+The background `StartGossipWorker` runs every 50ms:
+1. For each neighbor, atomically extract all pending messages (`extractPending`).
+2. If non-empty, spawn a goroutine to send the batch via `SyncRPC` (300ms timeout).
+3. On failure, `requeueMessages` merges the failed batch back into the pending buffer.
+
+This decouples the fast path (handler receives a message, stores it, queues it) from the slow path (network delivery with retries), keeping handlers responsive even during partitions.
+
+### The CAP Theorem (Building an AP System)
+
+This challenge exercises the **P** in CAP. The system is **AP (Available and Partition-tolerant)**:
+- **Available**: Nodes continue accepting `broadcast` writes and `read` queries even when isolated.
+- **Eventually Consistent**: Reads during a partition may return stale data. Once the network heals, the anti-entropy worker bridges the gap.
+
+**Test parameters**: 5 nodes, 20 seconds, 10 req/s, `--nemesis partition`.
+
+---
+
+## Challenge 3d/3e: Efficient Broadcast (Spanning Tree)
+
+### The Problem
+
+Cluster size jumps to 25 nodes with strict performance constraints:
+
+| Metric | Requirement |
+|---|---|
+| Messages per operation | < 30 |
+| Median latency | < 400ms |
+| Maximum latency | < 600ms |
+
+Maelstrom introduces `--latency 100`, meaning every network hop costs exactly 100ms. The naive "shout to everyone" gossip from 3b/3c causes broadcast storms (80+ msgs/op, 21-second latencies).
+
+### The Architectural Evolution
+
+Three approaches were tried:
+
+1. **Reliable Batching Queue**: Decouple foreground client requests from background network delivery. Instead of sending a network message per broadcast, buffer into a pending set. A background worker ticks periodically and sends batches. This reduces the number of network frames.
+
+2. **Randomized Epidemic Gossip**: Forward batches to $k$ random nodes. Failed due to the mathematical limits of probability -- high $k$ causes broadcast storms, low $k$ causes messages to fade out (the Wallflower Problem).
+
+3. **Deterministic Spanning Tree** (the winning approach): Override Maelstrom's provided grid topology with a computed tree.
+
+### The Spanning Tree Algorithm
+
+Based on the math behind a binary heap, generalized for any $k$-ary tree. Every node computes its position in the tree from the sorted node list, using a fan-out of $k = 10$:
+
+- **Find parent**: $\text{Parent Index} = \lfloor (i - 1) / k \rfloor$ (root node 0 has no parent)
+- **Find children**: $\text{Child Index} = (i \times k) + j$ for $j \in [1, k]$, bounded by cluster size.
+
+For 25 nodes with fan-out 10:
+```
+              n0 (root)
+       /    |    |    |   ...  \
+     n1    n2   n3   n4  ...  n10
+   / | \  / | \
+ n11...  n21...
+```
+
+Maximum depth = 2 hops. The longest message journey is 4 hops (leaf → root → leaf on the other side).
+
+```go
+func (s *Server) TopologyHandler(m maelstrom.Message) error {
+    allNodes := s.Node.NodeIDs()
+    myID := s.Node.ID()
+    var myIndex int
+    for i, id := range allNodes {
+        if id == myID {
+            myIndex = i
+            break
+        }
+    }
+
+    s.neighbors = []string{}
+    fanOut := 10
+
+    if myIndex > 0 {
+        parentIndex := (myIndex - 1) / fanOut
+        s.neighbors = append(s.neighbors, allNodes[parentIndex])
+    }
+
+    for j := 1; j <= fanOut; j++ {
+        childIndex := (myIndex * fanOut) + j
+        if childIndex < len(allNodes) {
+            s.neighbors = append(s.neighbors, allNodes[childIndex])
+        }
+    }
+
+    return s.Node.Reply(m, map[string]any{"type": "topology_ok"})
+}
+```
+
+Every node computes the exact same tree independently, with zero network coordination.
+
+### How Routing Works on the Tree
+
+When a message arrives at a node, `propagate()` forwards it to all neighbors **except** the sender:
+- If a parent sends a message down → the node forwards to all children.
+- If a child sends a message up → the node forwards to its parent and its *other* children.
+
+This guarantees every node sees the message exactly once (zero duplicates), giving $O(N)$ total messages.
+
+### The Batching + Anti-Entropy Worker
+
+The gossip worker ticks every 50ms, extracting batched pending messages per neighbor and sending them as a single `gossip` RPC. This means:
+- Multiple broadcasts arriving within a 50ms window are coalesced into one network message.
+- Failed deliveries are requeued and retried on the next tick (effectively up to 20 retries/second per neighbor).
+- Each `gossip()` call runs in its own goroutine with a 300ms timeout, so slow neighbors don't block others.
+
+```go
+func (s *Server) StartGossipWorker() {
+    ticker := time.NewTicker(50 * time.Millisecond)
+    for range ticker.C {
+        for _, neighborID := range s.neighbors {
+            batch := s.extractPending(neighborID)
+            if len(batch) == 0 {
+                continue
+            }
+            go s.gossip(neighborID, batch)
+        }
+    }
+}
+
+func (s *Server) gossip(neighborId string, messages []int64) {
+    ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+    defer cancel()
+    _, err := s.Node.SyncRPC(ctx, neighborId, map[string]any{
+        "type":     "gossip",
+        "messages": messages,
+    })
+    if err != nil {
+        s.requeueMessages(neighborId, messages)
+    }
+}
+```
+
+### The SPOF Trade-off
+
+While the spanning tree achieves perfect efficiency ($O(N)$ messages, $O(\log_k N)$ hops), it introduces a **Single Point of Failure (SPOF)**. Node 0 (`n0`) is the root. If it crashes or the network partitions around it, the tree severs and branches can no longer sync. This trade-off is acceptable for 3d/3e (stable network), but not for 3c (partitions), where epidemic gossip is required.
+
+### Latest Test Results (Challenge 3d/3e)
+
+```
+:valid?        true
+:count         1851 operations (894 broadcast, 957 read)
+:ok-count      1851 (0 failures)
+:availability  1.0 (100%)
+
+:net
+  :msgs-per-op     9.80   (target: < 30)  ✓
+  :server-msgs-per-op  7.75
+
+:stable-latencies
+  p0    =   0ms
+  p50   = 333ms   (target: < 400ms)  ✓
+  p95   = 455ms
+  p99   = 483ms
+  p100  = 533ms   (target: < 600ms)  ✓
+
+:lost-count        0
+:duplicated-count  0
+:never-read-count  0
+```
+
+All constraints passed with significant headroom: 9.80 msgs/op (vs 30 limit), 333ms median latency (vs 400ms limit), 533ms max latency (vs 600ms limit).
+
+---
+
+## Complete Message Flow
+
+### Broadcast Path (Happy Case)
+
+```
+Client                Node A             Worker A            Node B           Node C
+  │                     │                    │                  │                │
+  │─ broadcast(42) ────>│                    │                  │                │
+  │                     │ addMessage(42)     │                  │                │
+  │                     │ → true (new)       │                  │                │
+  │                     │ propagate(42,      │                  │                │
+  │                     │   exclude=client)  │                  │                │
+  │                     │ → pendingB += {42} │                  │                │
+  │                     │ → pendingC += {42} │                  │                │
+  │<─ broadcast_ok ─────│                    │                  │                │
+  │                     │                    │                  │                │
+  │                     │            [tick]  │                  │                │
+  │                     │                    │ extractPending(B)│                │
+  │                     │                    │ → [42]           │                │
+  │                     │                    │─── gossip([42]) ─>│               │
+  │                     │                    │                  │ addMessage(42) │
+  │                     │                    │                  │ → true         │
+  │                     │                    │                  │ propagate(42,  │
+  │                     │                    │                  │   exclude=A)   │
+  │                     │                    │<── gossip_ok ────│                │
+  │                     │                    │                  │                │
+  │                     │                    │ extractPending(C)│                │
+  │                     │                    │ → [42]           │                │
+  │                     │                    │─── gossip([42]) ─────────────────>│
+  │                     │                    │                  │                │ ...
+```
+
+### Failure and Retry Path
+
+```
+Worker A             Node B (partitioned)
+  │                       │
+  │── gossip([42]) ──X    │  (network partition)
+  │                       │
+  │ [300ms timeout]       │
+  │ requeueMessages(B, [42])
+  │ → pendingB += {42}   │
+  │                       │
+  │ [next tick, 50ms]     │
+  │── gossip([42]) ──X    │  (still partitioned)
+  │                       │
+  │ ... repeats until ... │
+  │                       │
+  │── gossip([42]) ──────>│  (partition heals)
+  │<── gossip_ok ─────────│
+```
+
+---
+
+## Concurrency Model
+
+The Maelstrom Go library dispatches each message to a new goroutine. This has direct implications:
+
+1. **All shared state must be thread-safe.** The `Server.counter` uses `atomic.Int64` (lock-free). The broadcast `messages` and `pendingMessages` maps are protected by `sync.RWMutex`.
+2. **STDOUT writes are serialized** by a mutex in `Node.Send()`, preventing interleaved JSON output.
+3. **STDIN reads are sequential** on the main goroutine (single scanner loop), so message ordering is preserved at the input level.
+4. **The anti-entropy worker** runs in a dedicated goroutine, spawning per-neighbor child goroutines for parallel sends.
+
+### Goroutine Topology
+
+```
+main goroutine
+  │
+  ├── Node.Run()           ← STDIN read loop (sequential)
+  │     ├── goroutine: EchoHandler(msg1)
+  │     ├── goroutine: BroadcastHandler(msg2)
+  │     ├── goroutine: GossipHandler(msg3)
+  │     └── ...            ← one goroutine per incoming message
+  │
+  └── StartGossipWorker()  ← ticker loop (50ms)
+        ├── goroutine: gossip("n1", [42, 43])
+        ├── goroutine: gossip("n2", [44])
+        └── ...            ← one goroutine per neighbor per tick
+```
+
+### Lock Hierarchy
+
+| Lock | Protects | Acquired by |
+|---|---|---|
+| `broadcastMu` (RWMutex) | `messages` map | `addMessage` (W), `getBroadcastMessages` (R) |
+| `pendingMu` (RWMutex) | `pendingMessages` map | `addPendingMessage` (W), `extractPending` (W), `requeueMessages` (W) |
+| `counter` (atomic) | Unique ID sequence | `UniqueIdHandler` (lock-free) |
+| `Node` internal mutex | STDOUT | `Reply`, `Send`, `SyncRPC` |
+
+The two RWMutexes are independent (no nested locking), so deadlocks between them are impossible.
+
+---
+
+## Distributed Systems Concepts Demonstrated
+
+| Concept | Where It Appears |
+|---|---|
+| Coordination-free design | Unique ID generation needs no inter-node communication |
+| CAP theorem (AP) | Nodes remain available during partitions, sacrificing strong consistency |
+| Gossip / flooding protocol | Challenges 3b/3c broadcast to neighbors |
+| Spanning tree topology | Challenges 3d/3e compute a deterministic k-ary tree for efficient routing |
+| Anti-entropy synchronization | Background worker periodically reconciles state (inspired by DynamoDB/Cassandra) |
+| Idempotency / deduplication | `addMessage` prevents reprocessing and infinite loops |
+| Batching | Pending messages accumulated between ticks are sent as a single RPC |
+| Retry with timeout | `gossip()` uses 300ms context timeout, `requeueMessages` on failure |
+| CRDTs (grow-only set) | The broadcast store is a G-Set: only additions, merge = union |
+| Fire-and-forget vs. acknowledged delivery | Evolution from `Send()` (3b, lossy) to `SyncRPC()` (3d, acknowledged) |
+| TOCTOU race condition | Fixed by combining check-and-write into a single locked operation |
+| Atomic swap (extract-and-clear) | `extractPending` replaces the bucket in O(1) to avoid races |
 
 ---
 
 ## Build System
 
-The `Makefile` provides three targets:
-
 | Target | What It Does |
 |---|---|
 | `build` | `go build -o bin/node ./cmd/node` |
-| `challenge-1` | Builds, then runs Maelstrom echo test (1 node, 10s) |
-| `challenge-2` | Builds, then runs Maelstrom unique-ids test (3 nodes, 30s, 1000 req/s, partitions) |
+| `challenge-1` | Echo test: 1 node, 10s |
+| `challenge-2` | Unique IDs test: 3 nodes, 30s, 1000 req/s, partitions |
+| `challenge-3a` | Single-node broadcast: 1 node, 20s, 10 req/s |
+| `challenge-3b` | Multi-node broadcast: 5 nodes, 20s, 10 req/s |
+| `challenge-3c` | Fault-tolerant broadcast: 5 nodes, 20s, 10 req/s, partitions |
+| `challenge-3d` | Efficient broadcast: 25 nodes, 20s, 100 req/s, 100ms latency |
+| `challenge-3e` | Efficient broadcast part 2: same parameters as 3d |
 | `clean` | Removes `bin/` and `store/` |
 
-Maelstrom test flags explained:
+Maelstrom test flags:
 - `-w <workload>`: which workload to run (echo, unique-ids, broadcast, etc.)
 - `--bin <path>`: path to the node binary
 - `--node-count N`: how many node processes to spawn
@@ -187,6 +557,7 @@ Maelstrom test flags explained:
 - `--rate N`: target requests per second
 - `--availability total`: every request must succeed (even during partitions)
 - `--nemesis partition`: inject network partitions during the test
+- `--latency N`: simulated network latency per hop (ms)
 
 ---
 
@@ -205,60 +576,110 @@ Maelstrom writes results to `store/<workload>/<timestamp>/`, producing:
 
 Maelstrom checks multiple properties:
 - **Availability**: fraction of operations that succeeded (target: 1.0)
-- **Workload-specific**: e.g., no duplicate IDs, all echoes correct
+- **Workload-specific**: e.g., no duplicate IDs, all echoes correct, no lost broadcasts
 - **Performance**: latency and rate graphs generated successfully
 - **Network**: message counts and per-operation message overhead
 - **Exceptions**: no unhandled crashes
 
----
+### Results Summary
 
-## Concurrency Model
-
-The Maelstrom Go library dispatches each message to a new goroutine. This has direct implications:
-
-1. **All shared state must be thread-safe.** The `Server.counter` uses `atomic.Int64` (lock-free). The archived broadcast implementations use `sync.RWMutex`-protected maps.
-2. **STDOUT writes are serialized** by a mutex in `Node.Send()`, preventing interleaved JSON output.
-3. **STDIN reads are sequential** on the main goroutine (single scanner loop), so message ordering is preserved at the input level.
-4. **Callbacks are goroutine-dispatched too** - RPC response handlers run in their own goroutines, requiring their own synchronization (as seen in the 3c archived broadcast's `ackMu`).
+| Challenge | Nodes | Ops | Failures | Msgs/Op | Median Latency | Max Latency | Notes |
+|---|---|---|---|---|---|---|---|
+| 1 (Echo) | 1 | 47 | 0 | 2.04 | - | - | Trivial pass |
+| 2 (Unique IDs) | 3 | 24,650 | 0 | 2.00 | - | - | 0 duplicates, under partitions |
+| 3d/3e (Broadcast) | 25 | 1,851 | 0 | 9.80 | 333ms | 533ms | 0 lost, 0 duplicated |
 
 ---
 
-## Distributed Systems Concepts Demonstrated
+## Archived Implementations (Historical Evolution)
 
-| Concept | Where It Appears |
-|---|---|
-| Coordination-free design | Unique ID generation needs no inter-node communication |
-| CAP theorem (AP) | Unique IDs remain available during partitions |
-| Gossip / flooding protocol | Challenge 3b broadcasts to all peers |
-| Idempotency / deduplication | Challenge 3b/3c check `IsExist` before processing |
-| Retry with backoff | Challenge 3c retries with linear backoff |
-| Async RPC with callbacks | Challenge 3c uses `Node.RPC()` for acknowledged delivery |
-| CRDTs (grow-only set) | The broadcast store is essentially a G-Set - only additions, merge = union |
-| Fire-and-forget vs. acknowledged delivery | 3b uses `Send()` (lossy), 3c uses `RPC()` (acknowledged) |
+The `archived/` directory preserves earlier standalone implementations. Each was its own Go module. Studying them reveals the learning progression:
+
+### Challenge 1 (archived): Echo
+
+Identical logic to the current version, but as a flat `main.go` with an inline closure handler instead of a method on a struct.
+
+### Challenge 2 (archived): Unique IDs - Experimentation
+
+The archived version reveals experimentation with multiple ID generation strategies:
+
+1. **Google UUID (`uuid.New().String()`)** - Passed. Relies on cryptographic randomness. Works but is heavier than needed.
+2. **MongoDB ObjectID (`primitive.NewObjectID().Hex()`)** - Passed. 12-byte IDs combining timestamp + machine ID + process ID + counter. The final chosen approach in the archive.
+3. **Twitter Snowflake (`snowflake.Node.Generate()`)** - **Did not work**. Required passing the Node ID as an integer, but Maelstrom assigns string IDs like `"n0"`.
+4. **Timestamp only (`time.Now().UnixMicro()`)** - **Did not work**. Collisions between nodes generating the same microsecond timestamp.
+
+The current implementation supersedes all of these with the simpler composite key approach (zero external dependencies).
+
+### Challenge 3a (archived): Single-Node Broadcast
+
+A naive single-node implementation:
+- Stores broadcast messages in a plain `[]float64` slice (not thread-safe).
+- No inter-node communication, no mutex protection.
+- Only works for single-node tests.
+
+### Challenge 3b (archived): Multi-Node Broadcast
+
+Adds multi-node support:
+1. **Thread-safe storage**: switched from `[]float64` to `map[int]struct{}` protected by `sync.RWMutex`.
+2. **Deduplication**: checks if a message was already seen before processing.
+3. **Flooding protocol**: on receiving a new broadcast, forwards to every other node (excluding self and sender) using `Node.Send()` (fire-and-forget).
+4. **Peer vs. client routing hack**: replies `broadcast_ok` only to Maelstrom clients (IDs starting with `c`), not to peer nodes (IDs starting with `n`).
+
+Weakness: `Node.Send()` is fire-and-forget. If a message is dropped, it's lost permanently.
+
+### Challenge 3c (archived): Fault-Tolerant Broadcast
+
+The most sophisticated archived implementation:
+1. **`MemStore`**: A dedicated thread-safe KV store, cleanly separated into its own file.
+2. **RPC with retries**: Uses `Node.RPC()` with callbacks. An `ack` flag (mutex-protected) tracks delivery.
+3. **Goroutine-per-peer**: Each broadcast spawns a goroutine per target that retries up to 100 times.
+4. **Linear backoff**: `i * 100ms` on the i-th retry (100ms, 200ms, 300ms...).
+5. **Non-blocking**: Reply to client immediately; retries are asynchronous background work.
+
+### Evolution from Archived to Current
+
+The current implementation represents a significant architectural shift from the archived code:
+
+| Aspect | Archived 3c | Current 3d/3e |
+|---|---|---|
+| Delivery strategy | Per-message RPC retries | State-centric anti-entropy worker |
+| Retry mechanism | Goroutine-per-peer with linear backoff | Ticker-based batch requeue (50ms) |
+| Topology | Flood to all nodes | Deterministic spanning tree (fan-out 10) |
+| Message format | Individual broadcasts | Batched gossip arrays |
+| RPC style | Async `Node.RPC()` + callback | Sync `Node.SyncRPC()` + timeout |
+| Scalability | Poor (goroutine explosion under partitions) | Good (bounded goroutines, batching) |
 
 ---
 
-## Observations
+## Design Decisions and Observations
 
-### Design Decisions
+### Single Binary, Multiple Handlers
+All challenge handlers coexist in one binary. Maelstrom only sends the relevant message types per workload, so unused handlers are inert. This simplifies the build and avoids code duplication.
 
-- **Single binary, multiple handlers**: The current architecture registers all challenge handlers on one binary. This is clean but means the binary grows with each challenge. Maelstrom only sends the message types relevant to the workload being tested, so unused handlers are inert.
-- **No external dependencies in current code**: The refactored version dropped UUID, Snowflake, and MongoDB libraries in favor of a zero-dependency composite key. Simpler and more educational.
-- **Atomic vs. Mutex**: The unique ID handler uses `atomic.Int64` instead of a mutex-protected counter. This is a good choice - atomic operations are lock-free and significantly faster for simple increment operations.
+### No External Dependencies in Current Code
+The refactored version dropped UUID, Snowflake, and MongoDB libraries in favor of a zero-dependency composite key. Simpler and more educational.
 
-### Potential Improvements
+### Atomic vs. Mutex
+The unique ID handler uses `atomic.Int64` instead of a mutex-protected counter. Atomic operations are lock-free and significantly faster for simple increment operations.
 
-- **Challenge 3 not yet ported**: The broadcast challenges exist only in `archived/`. Porting them to the current `internal/node/` structure would complete the project.
-- **Broadcast 3c's backoff**: Linear backoff (`i * 100ms`) is simple but not optimal. Exponential backoff with jitter would reduce network congestion during partitions.
-- **Broadcast 3c's topology**: All three broadcast implementations ignore the `topology` message and flood to all nodes. Using the provided topology (e.g., a spanning tree) would reduce message overhead, which is relevant for later challenges (3d, 3e) that have strict message budget constraints.
-- **No tests**: The project has no Go unit tests. The Maelstrom integration tests serve as end-to-end validation, but unit tests for individual handlers would be straightforward to write (the library supports injecting mock STDIN/STDOUT).
+### The `json.Number` Choice
+The `BroadcastHandler` uses `json.Number` instead of `float64` for message values. This avoids floating-point precision loss when converting JSON numbers to integers (Go's `json.Unmarshal` defaults to `float64` for numbers in `interface{}` values).
 
-### Git History
+### Topology Computed Locally, Not from Maelstrom
+The `TopologyHandler` ignores the topology Maelstrom sends and computes its own spanning tree. This is allowed and preferred because the default topology (grid) is suboptimal for the efficiency constraints.
 
-The project evolved in two phases:
+### `neighbors` Without a Mutex
+The `neighbors` slice has no mutex protection. This is safe because it is written exactly once (when the `topology` message arrives at startup) and only read afterwards. The Go memory model guarantees visibility via happens-before from the Maelstrom message dispatch.
 
-1. **Phase 1** (commits `6ff6303` through `f4cca09`): Individual challenge solutions, each as a standalone module. Progressed from echo through broadcast with partitions.
-2. **Phase 2** (commits `aab8142` through `d43efaa`): Archived all old implementations, restructured into `cmd/internal` layout, re-implemented challenges 1-2 with cleaner code.
+---
+
+## Potential Improvements
+
+- **Challenge 3c regression**: The current spanning tree topology introduces a SPOF that would fail challenge 3c (partitions). A hybrid approach (spanning tree for efficiency + fallback epidemic gossip during detected failures) could pass both 3c and 3d/3e.
+- **No Go unit tests**: The project relies entirely on Maelstrom integration tests. Unit tests for `addMessage`, `extractPending`, `propagate`, etc. would be straightforward and catch regressions faster.
+- **Dynamic fan-out**: The fan-out is hardcoded to 10. Computing an optimal fan-out based on cluster size and latency constraints would make the implementation more general.
+- **Adaptive tick interval**: The 50ms tick is a fixed trade-off between latency and network overhead. An adaptive interval (faster during high throughput, slower during quiet periods) could improve both.
+- **Gossip protocol metrics**: Adding counters for messages sent/received, retries, and batch sizes would aid debugging and performance tuning.
 
 ---
 
@@ -268,7 +689,6 @@ Based on the Maelstrom documentation, the following workloads remain:
 
 | Workload | Description |
 |---|---|
-| Broadcast (3d/3e) | Efficiency-constrained broadcast (message budgets, latency targets) |
 | G-Counter | Grow-only counter (CRDT) |
 | G-Set | Grow-only set (CRDT) |
 | Pn-Counter | Positive-negative counter (increment + decrement) |
@@ -277,4 +697,13 @@ Based on the Maelstrom documentation, the following workloads remain:
 | Txn-list-append | Transactional list-append workload |
 | Txn-rw-register | Transactional read-write register workload |
 
-Maelstrom also provides built-in services (`lin-kv`, `seq-kv`, `lww-kv`, `lin-tso`) that nodes can use as building blocks for more complex systems - for example, using the linearizable KV store as a foundation for a transaction protocol.
+Maelstrom also provides built-in services (`lin-kv`, `seq-kv`, `lww-kv`, `lin-tso`) that nodes can use as building blocks for more complex systems -- for example, using the linearizable KV store as a foundation for a transaction protocol.
+
+---
+
+## Git History
+
+The project evolved in two phases:
+
+1. **Phase 1**: Individual challenge solutions, each as a standalone Go module. Progressed from echo through fault-tolerant broadcast (challenges 1, 2, 3a, 3b, 3c).
+2. **Phase 2**: Archived all old implementations, restructured into `cmd/internal` layout, re-implemented all challenges (1, 2, 3a-3e) in the unified binary with cleaner code, spanning tree topology, and batched anti-entropy.
