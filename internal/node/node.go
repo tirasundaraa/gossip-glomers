@@ -27,13 +27,21 @@ type Server struct {
 	// e.g: "n2" -> {42: struct{}, 43: struct{}}
 	pendingMu       sync.RWMutex
 	pendingMessages map[string]map[int64]struct{}
+
+	// challenge 4: Grow-only Counter
+	// Maelstrom sequential kv store
+	KV   *maelstrom.KV
+	kvMu sync.Mutex
 }
 
 func NewServer() *Server {
+	node := maelstrom.NewNode()
+
 	return &Server{
-		Node:            maelstrom.NewNode(),
+		Node:            node,
 		messages:        make(map[int64]struct{}),
 		pendingMessages: make(map[string]map[int64]struct{}),
+		KV:              maelstrom.NewSeqKV(node),
 	}
 }
 

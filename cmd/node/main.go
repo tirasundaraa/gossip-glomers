@@ -12,9 +12,13 @@ func main() {
 	s.Node.Handle("echo", s.EchoHandler)
 	s.Node.Handle("generate", s.UniqueIdHandler)
 	s.Node.Handle("broadcast", s.BroadcastHandler)
-	s.Node.Handle("read", s.ReadHandler)
+	//s.Node.Handle("read", s.ReadHandler)  // comment this out. we need to introduce another "read" request for challenge 4.
 	s.Node.Handle("topology", s.TopologyHandler)
 	s.Node.Handle("gossip", s.GossipHandler)
+
+	// challenge 4: Grow-only Counter
+	s.Node.Handle("add", s.AddGCounterHandler)
+	s.Node.Handle("read", s.ReadGCounterHandler)
 
 	// Start the background worker for the anti-entropy synchronization
 	go s.StartGossipWorker()

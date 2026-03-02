@@ -48,6 +48,10 @@ challenge-3d: build
 challenge-3e: build
 	./maelstrom/maelstrom test -w broadcast --bin ./bin/node --node-count 25 --time-limit 20 --rate 100 --latency 100
 
+# Challenge 4 (Grow-only counter)
+challenge-4: build
+	./maelstrom/maelstrom test -w g-counter --bin ./bin/node --node-count 3 --rate 100 --time-limit 20 --nemesis partition
+
 # Helper to view the logs if something crashes
 # Maelstrom logs are in store/<test-name>/node-logs/
 clean:
